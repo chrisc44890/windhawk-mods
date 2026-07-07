@@ -1,9 +1,9 @@
 // ==WindhawkMod==
-// @id              cursor-smear-frames
-// @name            Cursor Smear Frames
+// @id              cursor-motion-blur
+// @name            Cursor Motion Blur
 // @description     Adds high-speed cartoon motion blur to your mouse pointer.
 // @version         2.0
-// @author          TheatriCHris
+// @author          TheatriChris
 // @github          https://github.com/chrisc44890
 // @license         MIT
 // @include         windhawk.exe
