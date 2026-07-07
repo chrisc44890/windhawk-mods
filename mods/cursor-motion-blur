@@ -183,7 +183,7 @@ VOID CALLBACK SmearTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTim
     float velocity = sqrt((float)(dx * dx + dy * dy));
     g_lastPos = pt; 
 
-    // Move these bitches to the top so we can manipulate them from inside the game check
+    // Move these to the top so we can manipulate them from inside the game check
     static DWORD lastFullscreenCheck = 0;
     static bool isGameCached = false;
     static bool isSmearing = false;
@@ -208,7 +208,7 @@ VOID CALLBACK SmearTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTim
             ToggleCursor(true);
             // We DO NOT return here! Let it bleed into the drawing block so it pushes a blank frame to the GPU and wipes the screen
         } else {
-            return; // Everything is clean, go the fuck to sleep
+            return; // Everything is clean, go to sleep
         }
     } else {
         CacheRealCursor();
