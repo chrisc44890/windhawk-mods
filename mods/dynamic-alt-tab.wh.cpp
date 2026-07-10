@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id            dynamic-alt-tab
 // @name          Dynamic Alt-Tab
-// @description   Replaces the native Windows Alt-Tab with a fluid, hardware-accelerated live glass carousel and custom themes.
+// @description   Replaces the native Windows Alt-Tab with a different fluidly animated interfaces.
 // @version       1.0
 // @author        TheatriChris
 // @github        https://github.com/chrisc44890
@@ -12,7 +12,7 @@
 // ==WindhawkModReadme==
 /*
 # Dynamic Alt-Tab
-Replaces the native Windows Alt-Tab screen with a fluid, hardware-accelerated live glass carousel and custom themes.
+Replaces the native Windows Alt-Tab screen with different fluidly animated themes.
 
 **Note:** This mod relies on internal Windows 11 APIs (`twinui.pcshell.dll`) and is designed specifically for Windows 11 and tested on 25H2. It may not hook successfully on Windows 10 or unsupported Insider builds.
 
