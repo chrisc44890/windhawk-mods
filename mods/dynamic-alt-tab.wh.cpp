@@ -5,7 +5,7 @@
 // @version       1.0
 // @author        TheatriChris
 // @github        https://github.com/chrisc44890
-// @include       explorer.exe
+// @include       *
 // @compilerOptions -ld2d1 -ldwmapi -lole32 -lgdi32 -lshell32 -ldwrite -lversion -luuid
 // ==/WindhawkMod==
 
@@ -118,6 +118,7 @@ bool g_isClosing = false;
 bool g_isFirstFrame = false;
 int g_selectedIndex = 0;
 POINT g_mousePos = { 0, 0 };
+HWND g_targetHwnd = NULL;
 
 float g_introOutroProgress = 0.0f;
 float g_introOutroTarget = 0.0f;
@@ -285,6 +286,7 @@ void StartAltTab() {
     g_introOutroProgress = 0.0f;
     g_introOutroTarget = 1.0f;
     g_cancelAltTab = false;
+    g_targetHwnd = NULL;
     
     for (auto& card : g_cards) {
         if (card.thumbnail) DwmUnregisterThumbnail(card.thumbnail);
@@ -330,37 +332,15 @@ void StopAltTab() {
     g_isClosing = true;
     g_introOutroTarget = 0.0f; 
     
-    if (g_cancelAltTab) {
-        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    // Release the physical Alt key immediately so it doesn't get stuck during the animation
+    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+
+    if (g_cancelAltTab || g_cards.empty() || g_selectedIndex < 0 || g_selectedIndex >= (int)g_cards.size()) {
+        g_targetHwnd = NULL;
         return;
     }
 
-    if (!g_cards.empty() && g_selectedIndex >= 0 && g_selectedIndex < (int)g_cards.size()) {
-        HWND target = g_cards[g_selectedIndex].hwnd;
-        
-        if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
-        
-        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
-        
-        SetForegroundWindow(g_overlayHwnd);
-        
-        DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), NULL);
-        DWORD targetThread = GetWindowThreadProcessId(target, NULL);
-        
-        if (fgThread != targetThread) {
-            AttachThreadInput(fgThread, targetThread, TRUE);
-            SetWindowPos(target, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            SetWindowPos(target, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
-            SetForegroundWindow(target);
-            SetFocus(target);
-            AttachThreadInput(fgThread, targetThread, FALSE);
-        } else {
-            SetForegroundWindow(target);
-            SetFocus(target);
-        }
-        
-        SwitchToThisWindow(target, TRUE); 
-    }
+    g_targetHwnd = g_cards[g_selectedIndex].hwnd;
 }
 
 // Global debounced trigger to handle both native hooks and fallback hooks gracefully
@@ -483,7 +463,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         std::vector<int> clickOrder(g_cards.size());
         for (int i = 0; i < (int)g_cards.size(); ++i) clickOrder[i] = i;
         std::sort(clickOrder.begin(), clickOrder.end(), [](int a, int b) {
-            return fabsf((float)a - (float)g_selectedIndex) < fabsf((float)b - (float)g_selectedIndex);
+            float distA = fabsf((float)a - (float)g_selectedIndex);
+            float distB = fabsf((float)b - (float)g_selectedIndex);
+            if (distA == distB) return a < b; // Stable tie breaker for perfectly overlapping Z-indexes
+            return distA < distB; // Sort front-to-back
         });
 
         for (int i : clickOrder) {
@@ -560,6 +543,29 @@ VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTi
         g_cards.clear();
         ShowWindow(hwnd, SW_HIDE);
         ReleaseDC(NULL, hdcScreen);
+
+        // NOW we actually switch the window, after the GPU is done with our animation
+        if (g_targetHwnd) {
+            if (IsIconic(g_targetHwnd)) ShowWindow(g_targetHwnd, SW_RESTORE);
+
+            DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), NULL);
+            DWORD targetThread = GetWindowThreadProcessId(g_targetHwnd, NULL);
+
+            if (fgThread != targetThread) {
+                AttachThreadInput(fgThread, targetThread, TRUE);
+                SetWindowPos(g_targetHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                SetWindowPos(g_targetHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
+                SetForegroundWindow(g_targetHwnd);
+                SetFocus(g_targetHwnd);
+                AttachThreadInput(fgThread, targetThread, FALSE);
+            } else {
+                SetForegroundWindow(g_targetHwnd);
+                SetFocus(g_targetHwnd);
+            }
+
+            SwitchToThisWindow(g_targetHwnd, TRUE);
+            g_targetHwnd = NULL;
+        }
         return;
     }
     
@@ -873,8 +879,28 @@ VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTi
         std::sort(renderOrder.begin(), renderOrder.end(), [](int a, int b) {
             float distA = fabsf((float)a - (float)g_selectedIndex);
             float distB = fabsf((float)b - (float)g_selectedIndex);
-            return distA > distB; 
+            if (distA == distB) return a > b; // Stable tie breaker
+            return distA > distB; // Render back-to-front
         });
+
+        // Pre-calculate the absolute top-most card that the mouse is hovering over
+        // so we don't accidentally hover 4 overlapping cards at once in the 3D carousel
+        int topHoveredIndex = -1;
+        for (auto it = renderOrder.rbegin(); it != renderOrder.rend(); ++it) {
+            int i = *it;
+            AppCard& card = g_cards[i];
+            float squishX = (g_theme == 3) ? card.vx * 0.16f : 0.0f;
+            float cardW = (card.currentWidthRadius + squishX) * card.currentScale;
+            float cardH = 380.0f * card.currentScale;
+            
+            if (g_mousePos.x >= (card.currentX - cardW) && 
+                g_mousePos.x <= (card.currentX + cardW) && 
+                g_mousePos.y >= (card.currentY - cardH / 2.0f) && 
+                g_mousePos.y <= (card.currentY + cardH / 2.0f)) {
+                topHoveredIndex = i;
+                break;
+            }
+        }
 
         for (int i : renderOrder) {
             AppCard& card = g_cards[i];
@@ -894,10 +920,7 @@ VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTi
             
             float cardW = (card.currentWidthRadius + squishX) * card.currentScale;
             float cardH = 380.0f * card.currentScale;
-            bool isHovered = (g_mousePos.x > (card.currentX - cardW) && 
-                              g_mousePos.x < (card.currentX + cardW) && 
-                              g_mousePos.y > (card.currentY - cardH / 2.0f) && 
-                              g_mousePos.y < (card.currentY + cardH / 2.0f));
+            bool isHovered = (i == topHoveredIndex);
             
             if (isHovered && i != g_selectedIndex) {
                 card.currentScale += (card.targetScale * 1.05f - card.currentScale) * 0.4f;
@@ -923,7 +946,8 @@ VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTi
                 thumbOpac = (i == g_selectedIndex ? 1.0f : 0.8f * depthDarken);
                 textOpac = depthDarken * g_introOutroProgress;
                 
-                g_pGlassBrush->SetColor(D2D1::ColorF(0.12f * depthDarken, 0.12f * depthDarken, 0.15f * depthDarken, 1.0f * g_introOutroProgress));
+                // Deep solid charcoal for the 3D cards
+                g_pGlassBrush->SetColor(D2D1::ColorF(0.04f * depthDarken, 0.04f * depthDarken, 0.05f * depthDarken, 1.0f * g_introOutroProgress));
                 if (i == g_selectedIndex) {
                     g_pBorderBrush->SetColor(D2D1::ColorF(0.85f, 0.35f, 0.95f, 1.0f * g_introOutroProgress));
                 } else {
@@ -1259,12 +1283,14 @@ BOOL Wh_ModInit() {
     bool isExplorer = (wcsstr(exeName, L"explorer.exe") != NULL);
     bool isWindhawk = (wcsstr(exeName, L"windhawk.exe") != NULL);
 
-
+    // If we're inside a random game/browser, bail out instantly to save resources.
+    // The explorer and windhawk hooks are enough to catch elevated and non-elevated keys.
     if (!isExplorer && !isWindhawk) {
         return TRUE;
     }
 
     if (isExplorer) {
+        // EXPLORER ONLY: We only want ONE overlay window rendering at a time!
         HMODULE twinui = LoadLibraryW(L"twinui.pcshell.dll");
         if (twinui) {
             // twinui.pcshell.dll
@@ -1299,8 +1325,9 @@ BOOL Wh_ModInit() {
         CloseHandle(hEvent);
     }
 
-
-    // The keys are piped instantly to the Explorer overlay via PostMessage.
+    // EXPLORER & WINDHAWK: We install the keyboard hook so we can catch keys in 
+    // Medium Integrity (Explorer) AND High Integrity (Windhawk).
+    // The keys are piped instantly to the Explorer overlay via PostMessage!
     HANDLE hHookEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     g_hookThreadHandle = CreateThread(NULL, 0, HookThreadProc, hHookEvent, 0, &g_hookThreadId);
     if (g_hookThreadHandle) {
