@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id            dynamic-alt-tab
 // @name          Dynamic Alt-Tab
-// @description   Replaces the native Windows Alt-Tab with a different fluidly animated interfaces.
+// @description   Replaces the native Windows Alt-Tab with a fluid, hardware-accelerated live glass carousel and custom themes.
 // @version       1.0
 // @author        TheatriChris
 // @github        https://github.com/chrisc44890
@@ -12,9 +12,9 @@
 // ==WindhawkModReadme==
 /*
 # Dynamic Alt-Tab
-Replaces the native Windows Alt-Tab screen with different fluidly animated themes.
+Replaces the native Windows Alt-Tab screen with a fluid, hardware-accelerated live glass carousel and custom themes.
 
-**Note:** This mod relies on internal Windows 11 APIs (`twinui.pcshell.dll`) and is designed specifically for Windows 11 and tested on 25H2. It may not hook successfully on Windows 10 or unsupported Insider builds.
+**Note:** This mod relies on internal Windows 11 APIs (`twinui.pcshell.dll`) and is designed specifically for Windows 11. It may not hook successfully on Windows 10 or unsupported Insider builds.
 
 ### Features
 * **Hardware Accelerated:** Built with Direct2D 1.1 for buttery smooth 60FPS rendering.
@@ -1177,12 +1177,13 @@ BOOL Wh_ModInit() {
     LoadSettings();
     HMODULE twinui = LoadLibraryW(L"twinui.pcshell.dll");
     if (twinui) {
-        WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        // twinui.pcshell.dll
+        WindhawkUtils::SYMBOL_HOOK twinui_pcshell_dll_hooks[] = {
             { {LR"(public: virtual long __cdecl XamlAltTabViewHost::ViewLoaded(void))"}, &XamlAltTabViewHost_ViewLoaded_Original, XamlAltTabViewHost_ViewLoaded_Hook, true },
             { {LR"(private: void __cdecl XamlAltTabViewHost::DisplayAltTab(void))"}, &XamlAltTabViewHost_DisplayAltTab_Original, XamlAltTabViewHost_DisplayAltTab_Hook, true },
             { {LR"(public: virtual long __cdecl CAltTabViewHost::Show(struct IImmersiveMonitor *,enum ALT_TAB_VIEW_FLAGS,struct IApplicationView *))"}, &CAltTabViewHost_Show_Original, CAltTabViewHost_Show_Hook, true }
         };
-        if (!WindhawkUtils::HookSymbols(twinui, hooks, ARRAYSIZE(hooks))) {
+        if (!WindhawkUtils::HookSymbols(twinui, twinui_pcshell_dll_hooks, ARRAYSIZE(twinui_pcshell_dll_hooks))) {
             Wh_Log(L"Dynamic Alt-Tab: Failed to hook twinui.pcshell.dll symbols. Mod may not function correctly.");
             return FALSE;
         }
