@@ -14,7 +14,7 @@
 # Dynamic Alt-Tab
 Replaces the native Windows Alt-Tab screen with a fluid, hardware-accelerated live glass carousel and custom themes.
 
-**Note:** This mod relies on internal Windows 11 APIs (`twinui.pcshell.dll`) and is designed specifically for Windows 11. It may not hook successfully on Windows 10 or unsupported Insider builds.
+**Note:** This mod relies on internal Windows 11 APIs (`twinui.pcshell.dll`) and is designed specifically for Windows 11 and tested on version 25H2. It may not hook successfully on Windows 10 or unsupported Insider builds.
 
 ### Features
 * **Hardware Accelerated:** Built with Direct2D 1.1 for buttery smooth 60FPS rendering.
@@ -1153,20 +1153,15 @@ using ShowWindow_t = decltype(&ShowWindow);
 ShowWindow_t ShowWindow_Original;
 BOOL WINAPI ShowWindow_Hook(HWND hWnd, int nCmdShow) {
     if (nCmdShow != SW_HIDE) {
-        // Note: This suppresses ShowWindow calls for ANY window on the thread while the 
-        // internal immersive layout methods are executing. Explorer's Alt-Tab thread is 
-        // highly isolated, so this safely catches the native switcher without collateral damage.
-        if (g_threadIdForAltTabShowWindow == GetCurrentThreadId()) {
-            return TRUE; 
-        }
-        
-        wchar_t className[256];
-        if (GetClassNameW(hWnd, className, 256)) {
-            if (wcscmp(className, L"XamlExplorerHostIslandWindow") == 0 ||
-                wcscmp(className, L"MultitaskingViewFrame") == 0 ||
-                wcscmp(className, L"TaskSwitcherWnd") == 0 ||
-                wcscmp(className, L"Shell_InputSwitchTopLevelWindow") == 0) {
-                return TRUE; 
+        if (g_threadIdForAltTabShowWindow == GetCurrentThreadId() || g_wantsToOpen.load() || g_isAltTabbing) {
+            wchar_t className[256];
+            if (GetClassNameW(hWnd, className, 256)) {
+                if (wcscmp(className, L"XamlExplorerHostIslandWindow") == 0 ||
+                    wcscmp(className, L"MultitaskingViewFrame") == 0 ||
+                    wcscmp(className, L"TaskSwitcherWnd") == 0 ||
+                    wcscmp(className, L"Shell_InputSwitchTopLevelWindow") == 0) {
+                    return TRUE; 
+                }
             }
         }
     }
@@ -1177,19 +1172,16 @@ BOOL Wh_ModInit() {
     LoadSettings();
     HMODULE twinui = LoadLibraryW(L"twinui.pcshell.dll");
     if (twinui) {
-        // twinui.pcshell.dll
-        WindhawkUtils::SYMBOL_HOOK twinui_pcshell_dll_hooks[] = {
-            { {LR"(public: virtual long __cdecl XamlAltTabViewHost::ViewLoaded(void))"}, &XamlAltTabViewHost_ViewLoaded_Original, XamlAltTabViewHost_ViewLoaded_Hook, true },
-            { {LR"(private: void __cdecl XamlAltTabViewHost::DisplayAltTab(void))"}, &XamlAltTabViewHost_DisplayAltTab_Original, XamlAltTabViewHost_DisplayAltTab_Hook, true },
-            { {LR"(public: virtual long __cdecl CAltTabViewHost::Show(struct IImmersiveMonitor *,enum ALT_TAB_VIEW_FLAGS,struct IApplicationView *))"}, &CAltTabViewHost_Show_Original, CAltTabViewHost_Show_Hook, true }
+        WindhawkUtils::SYMBOL_HOOK twinuiPcshellDllHooks[] = {
+            { {LR"(public: virtual long __cdecl XamlAltTabViewHost::ViewLoaded(void))"}, &XamlAltTabViewHost_ViewLoaded_Original, XamlAltTabViewHost_ViewLoaded_Hook, false },
+            { {LR"(private: void __cdecl XamlAltTabViewHost::DisplayAltTab(void))"}, &XamlAltTabViewHost_DisplayAltTab_Original, XamlAltTabViewHost_DisplayAltTab_Hook, false },
+            { {LR"(public: virtual long __cdecl CAltTabViewHost::Show(struct IImmersiveMonitor *,enum ALT_TAB_VIEW_FLAGS,struct IApplicationView *))"}, &CAltTabViewHost_Show_Original, CAltTabViewHost_Show_Hook, false }
         };
-        if (!WindhawkUtils::HookSymbols(twinui, twinui_pcshell_dll_hooks, ARRAYSIZE(twinui_pcshell_dll_hooks))) {
-            Wh_Log(L"Dynamic Alt-Tab: Failed to hook twinui.pcshell.dll symbols. Mod may not function correctly.");
-            return FALSE;
+        if (!WindhawkUtils::HookSymbols(twinui, twinuiPcshellDllHooks, ARRAYSIZE(twinuiPcshellDllHooks))) {
+            Wh_Log(L"Dynamic Alt-Tab: Failed to hook twinui.pcshell.dll symbols. Falling back to aggressive ShowWindow blocking.");
         }
     } else {
-        Wh_Log(L"Dynamic Alt-Tab: twinui.pcshell.dll not found. System unsupported.");
-        return FALSE;
+        Wh_Log(L"Dynamic Alt-Tab: twinui.pcshell.dll not found. Falling back to aggressive ShowWindow blocking.");
     }
     
     if (!WindhawkUtils::SetFunctionHook((void*)ShowWindow, (void*)ShowWindow_Hook, (void**)&ShowWindow_Original)) {
