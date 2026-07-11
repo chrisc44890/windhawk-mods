@@ -1170,14 +1170,15 @@ BOOL WINAPI ShowWindow_Hook(HWND hWnd, int nCmdShow) {
 
 BOOL Wh_ModInit() {
     LoadSettings();
-    HMODULE twinui = LoadLibraryW(L"twinui.pcshell.dll");
-    if (twinui) {
-        WindhawkUtils::SYMBOL_HOOK twinui_pcshell_dll_hooks[] = {
-            { {LR"(public: virtual long __cdecl XamlAltTabViewHost::ViewLoaded(void))"}, &XamlAltTabViewHost_ViewLoaded_Original, XamlAltTabViewHost_ViewLoaded_Hook, false },
-            { {LR"(private: void __cdecl XamlAltTabViewHost::DisplayAltTab(void))"}, &XamlAltTabViewHost_DisplayAltTab_Original, XamlAltTabViewHost_DisplayAltTab_Hook, false },
-            { {LR"(public: virtual long __cdecl CAltTabViewHost::Show(struct IImmersiveMonitor *,enum ALT_TAB_VIEW_FLAGS,struct IApplicationView *))"}, &CAltTabViewHost_Show_Original, CAltTabViewHost_Show_Hook, false }
-        };
-        if (!WindhawkUtils::HookSymbols(twinui, twinui_pcshell_dll_hooks, ARRAYSIZE(twinui_pcshell_dll_hooks))) {
+         HMODULE twinui = LoadLibraryW(L"twinui.pcshell.dll");
+         if (twinui) {
+              // twinui.pcshell.dll
+               WindhawkUtils::SYMBOL_HOOK twinuiPcshellHooks[] = {
+                  { {LR"(public: virtual long __cdecl XamlAltTabViewHost::ViewLoaded(void))"}, &XamlAltTabViewHost_ViewLoaded_Original, XamlAltTabViewHost_ViewLoaded_Hook, false },
+                  { {LR"(private: void __cdecl XamlAltTabViewHost::DisplayAltTab(void))"}, &XamlAltTabViewHost_DisplayAltTab_Original, XamlAltTabViewHost_DisplayAltTab_Hook, false },
+                  { {LR"(public: virtual long __cdecl CAltTabViewHost::Show(struct IImmersiveMonitor *,enum ALT_TAB_VIEW_FLAGS,struct IApplicationView *))"}, &CAltTabViewHost_Show_Original, CAltTabViewHost_Show_Hook, false }
+    };
+    if (!WindhawkUtils::HookSymbols(twinui, twinuiPcshellHooks, ARRAYSIZE(twinuiPcshellHooks))) {
             Wh_Log(L"Dynamic Alt-Tab: Failed to hook twinui.pcshell.dll symbols. Falling back to aggressive ShowWindow blocking.");
         }
     } else {
