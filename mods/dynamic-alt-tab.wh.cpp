@@ -5,7 +5,7 @@
 // @version       1.0
 // @author        TheatriChris
 // @github        https://github.com/chrisc44890
-// @include       *
+// @include       explorer.exe
 // @compilerOptions -ld2d1 -ldwmapi -lole32 -lgdi32 -lshell32 -ldwrite -lversion -luuid
 // ==/WindhawkMod==
 
@@ -14,13 +14,18 @@
 # Dynamic Alt-Tab
 Replaces the native Windows Alt-Tab screen with a fluid, hardware-accelerated live glass carousel and custom themes.
 
-**Note:** This mod relies on internal Windows 11 APIs (`twinui.pcshell.dll`) and is designed specifically for Windows 11 and tested on version 25H2. It may not hook successfully on Windows 10 or unsupported Insider builds.
+**Note:** This mod prefers to trigger off internal Windows 11 shell APIs
+(`twinui.pcshell.dll`), which is the most reliable method and is immune to
+focus-related quirks with elevated windows. On Windows builds where those
+internal symbols aren't available, the mod automatically falls back to a
+low-level keyboard hook instead; in that fallback mode, the carousel may
+occasionally fail to appear while an elevated (Run as Administrator) window
+is focused, due to Windows' UIPI input isolation between integrity levels.
 
 ### Features
 * **Hardware Accelerated:** Built with Direct2D 1.1 for buttery smooth 60FPS rendering.
 * **Live Thumbnails:** Uses DWM thumbnail routing to show real-time, live previews of your apps.
-* **Custom Themes:** 
-  * *3D Glass Carousel:* A gorgeous spatial rotating cylinder with physical depth shadows.
+* **Custom Themes:** * *3D Glass Carousel:* A gorgeous spatial rotating cylinder with physical depth shadows.
   ![3D Carousel](https://i.imgur.com/n8FrdUV.gif)
   * *macOS Style Flat Grid:* An Exposé-style grid with clean, silver-aluminum highlights.
   ![MacOS](https://i.imgur.com/no7EoWE.gif)
@@ -60,6 +65,9 @@ Replaces the native Windows Alt-Tab screen with a fluid, hardware-accelerated li
 #include <algorithm>
 #include <windhawk_utils.h>
 
+#define WM_ALTTAB_TRIGGER (WM_APP + 101)
+#define WM_ALTTAB_CANCEL  (WM_APP + 102)
+
 typedef UINT (WINAPI* timeBeginPeriod_t)(UINT);
 typedef UINT (WINAPI* timeEndPeriod_t)(UINT);
 
@@ -80,10 +88,11 @@ typedef BOOL(WINAPI* SetWindowCompositionAttribute_t)(HWND, CompositionAttribute
 
 HWND g_overlayHwnd = NULL;
 HANDLE g_renderThreadHandle = NULL;
+std::atomic<bool> g_threadRunning(false);
+
 HANDLE g_hookThreadHandle = NULL;
 DWORD g_hookThreadId = 0;
 HHOOK g_keyboardHook = NULL;
-std::atomic<bool> g_threadRunning(false);
 
 ID2D1Factory1* g_pD2DFactory = nullptr;
 ID2D1DCRenderTarget* g_pDCRenderTarget = nullptr;
@@ -251,7 +260,25 @@ D2D1_COLOR_F GetM3Color(int index, float alpha) {
     return D2D1::ColorF(0.48f, 0.72f, 0.92f, alpha); // Soft Sky Blue
 }
 
+void ForceForegroundOverlay() {
+    HWND curFg = GetForegroundWindow();
+    DWORD fgThread = curFg ? GetWindowThreadProcessId(curFg, NULL) : 0;
+    DWORD myThread = GetCurrentThreadId();
+
+    if (fgThread != 0 && fgThread != myThread) {
+        AttachThreadInput(fgThread, myThread, TRUE);
+        SetForegroundWindow(g_overlayHwnd);
+        SetFocus(g_overlayHwnd);
+        AttachThreadInput(fgThread, myThread, FALSE);
+    } else {
+        SetForegroundWindow(g_overlayHwnd);
+        SetFocus(g_overlayHwnd);
+    }
+}
+
 void StartAltTab() {
+    if (g_isAltTabbing) return;
+
     g_isAltTabbing = true;
     g_isClosing = false;
     g_isFirstFrame = true; 
@@ -295,6 +322,7 @@ void StartAltTab() {
     g_rightPoolVx1 = 0.0f; g_rightPoolVx2 = 0.0f; g_rightPoolVy = 0.0f; g_rightPoolVScale = 0.0f;
     
     ShowWindow(g_overlayHwnd, SW_SHOWNA);
+    ForceForegroundOverlay();
 }
 
 void StopAltTab() {
@@ -335,6 +363,26 @@ void StopAltTab() {
     }
 }
 
+// Global debounced trigger to handle both native hooks and fallback hooks gracefully
+void TriggerOpenIfOutermost(bool shiftDown) {
+    static DWORD lastTriggerTime = 0;
+    DWORD now = GetTickCount();
+    if (now - lastTriggerTime < 50) return; // 50ms debounce
+    lastTriggerTime = now;
+
+    if (!g_wantsToOpen.load()) {
+        g_wantsToOpen = true;
+        g_tabSteps = shiftDown ? -1 : 1;
+    } else {
+        g_tabSteps.fetch_add(shiftDown ? -1 : 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fallback trigger path: low-level keyboard hook.
+// IPC via PostMessage lets high-integrity processes (Windhawk) alert
+// the medium-integrity process (Explorer) without spanning multiple overlays.
+// ---------------------------------------------------------------------------
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     static bool s_tabDown = false;
     if (nCode == HC_ACTION) {
@@ -345,9 +393,9 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
                 if (!s_tabDown) {
                     s_tabDown = true;
-                    g_wantsToOpen = true;
                     bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-                    g_tabSteps.fetch_add(shiftDown ? -1 : 1);
+                    HWND overlay = FindWindowW(L"GlassAltTabOverlayClass", L"GlassAltTabOverlay");
+                    if (overlay) PostMessageW(overlay, WM_ALTTAB_TRIGGER, shiftDown ? 1 : 0, 0);
                 }
             } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
                 s_tabDown = false;
@@ -356,7 +404,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         }
         
         if ((p->vkCode == VK_LMENU || p->vkCode == VK_RMENU || p->vkCode == VK_MENU) && (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)) {
-            g_wantsToOpen = false;
+            HWND overlay = FindWindowW(L"GlassAltTabOverlayClass", L"GlassAltTabOverlay");
+            if (overlay) PostMessageW(overlay, WM_ALTTAB_CANCEL, 0, 0);
             s_tabDown = false;
         }
     }
@@ -364,7 +413,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 DWORD WINAPI HookThreadProc(LPVOID lpParam) {
-    HANDLE hEvent = (LPVOID)lpParam;
+    HANDLE hEvent = (HANDLE)lpParam;
     g_keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
     if (hEvent) SetEvent(hEvent);
     
@@ -378,9 +427,38 @@ DWORD WINAPI HookThreadProc(LPVOID lpParam) {
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    // Inter-Process Communication handler
+    if (uMsg == WM_ALTTAB_TRIGGER) {
+        TriggerOpenIfOutermost(wParam == 1);
+        return 0;
+    }
+    if (uMsg == WM_ALTTAB_CANCEL) {
+        g_wantsToOpen = false;
+        return 0;
+    }
+
     if (uMsg == WM_MOUSEMOVE) {
         g_mousePos.x = (int)(short)LOWORD(lParam);
         g_mousePos.y = (int)(short)HIWORD(lParam);
+    }
+
+    if ((uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) && g_isAltTabbing && !g_isClosing) {
+        if (wParam == VK_TAB) {
+            bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            g_tabSteps.fetch_add(shiftDown ? -1 : 1);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            g_cancelAltTab = true;
+            g_wantsToOpen = false;
+            return 0;
+        }
+    }
+
+    if ((uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP) &&
+        (wParam == VK_MENU || wParam == VK_LMENU || wParam == VK_RMENU)) {
+        g_wantsToOpen = false;
+        return 0;
     }
     
     if (uMsg == WM_MOUSEWHEEL && g_isAltTabbing && !g_isClosing) {
@@ -545,6 +623,7 @@ VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTi
         g_pDCRenderTarget->BindDC(g_hdcMem, &rc);
         g_pDCRenderTarget->BeginDraw();
         
+        // Use 0.01f to prevent DWM from discarding click events due to WS_EX_LAYERED perfect transparency 
         g_pDCRenderTarget->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.01f));
         
         if (g_pDimBrush) {
@@ -1137,6 +1216,7 @@ void WINAPI XamlAltTabViewHost_ViewLoaded_Hook(void* pThis) {
 using XamlAltTabViewHost_DisplayAltTab_t = void(WINAPI*)(void*);
 XamlAltTabViewHost_DisplayAltTab_t XamlAltTabViewHost_DisplayAltTab_Original;
 void WINAPI XamlAltTabViewHost_DisplayAltTab_Hook(void* pThis) {
+    TriggerOpenIfOutermost(false);
     if (g_threadIdForAltTabShowWindow != 0) return XamlAltTabViewHost_DisplayAltTab_Original(pThis);
     AutoThreadId lock;
     XamlAltTabViewHost_DisplayAltTab_Original(pThis);
@@ -1145,6 +1225,7 @@ void WINAPI XamlAltTabViewHost_DisplayAltTab_Hook(void* pThis) {
 using CAltTabViewHost_Show_t = HRESULT(WINAPI*)(void*, void*, void*, void*);
 CAltTabViewHost_Show_t CAltTabViewHost_Show_Original;
 HRESULT WINAPI CAltTabViewHost_Show_Hook(void* pThis, void* p1, void* p2, void* p3) {
+    TriggerOpenIfOutermost(false);
     AutoThreadId lock;
     return CAltTabViewHost_Show_Original(pThis, p1, p2, p3);
 }
@@ -1153,7 +1234,7 @@ using ShowWindow_t = decltype(&ShowWindow);
 ShowWindow_t ShowWindow_Original;
 BOOL WINAPI ShowWindow_Hook(HWND hWnd, int nCmdShow) {
     if (nCmdShow != SW_HIDE) {
-        if (g_threadIdForAltTabShowWindow == GetCurrentThreadId() || g_wantsToOpen.load() || g_isAltTabbing) {
+        if (g_threadIdForAltTabShowWindow == GetCurrentThreadId() || g_wantsToOpen.load() || g_isAltTabbing || g_isClosing) {
             wchar_t className[256];
             if (GetClassNameW(hWnd, className, 256)) {
                 if (wcscmp(className, L"XamlExplorerHostIslandWindow") == 0 ||
@@ -1170,39 +1251,56 @@ BOOL WINAPI ShowWindow_Hook(HWND hWnd, int nCmdShow) {
 
 BOOL Wh_ModInit() {
     LoadSettings();
-         HMODULE twinui = LoadLibraryW(L"twinui.pcshell.dll");
-         if (twinui) {
-              // twinui.pcshell.dll
-               WindhawkUtils::SYMBOL_HOOK twinuiPcshellHooks[] = {
-                  { {LR"(public: virtual long __cdecl XamlAltTabViewHost::ViewLoaded(void))"}, &XamlAltTabViewHost_ViewLoaded_Original, XamlAltTabViewHost_ViewLoaded_Hook, false },
-                  { {LR"(private: void __cdecl XamlAltTabViewHost::DisplayAltTab(void))"}, &XamlAltTabViewHost_DisplayAltTab_Original, XamlAltTabViewHost_DisplayAltTab_Hook, false },
-                  { {LR"(public: virtual long __cdecl CAltTabViewHost::Show(struct IImmersiveMonitor *,enum ALT_TAB_VIEW_FLAGS,struct IApplicationView *))"}, &CAltTabViewHost_Show_Original, CAltTabViewHost_Show_Hook, false }
-    };
-    if (!WindhawkUtils::HookSymbols(twinui, twinuiPcshellHooks, ARRAYSIZE(twinuiPcshellHooks))) {
-            Wh_Log(L"Dynamic Alt-Tab: Failed to hook twinui.pcshell.dll symbols. Falling back to aggressive ShowWindow blocking.");
-        }
-    } else {
-        Wh_Log(L"Dynamic Alt-Tab: twinui.pcshell.dll not found. Falling back to aggressive ShowWindow blocking.");
-    }
-    
-    if (!WindhawkUtils::SetFunctionHook((void*)ShowWindow, (void*)ShowWindow_Hook, (void**)&ShowWindow_Original)) {
-        Wh_Log(L"Dynamic Alt-Tab: Failed to hook ShowWindow. Mod may not function correctly.");
-        return FALSE;
+
+    WCHAR exeName[MAX_PATH];
+    GetModuleFileNameW(NULL, exeName, MAX_PATH);
+    _wcslwr_s(exeName);
+
+    bool isExplorer = (wcsstr(exeName, L"explorer.exe") != NULL);
+    bool isWindhawk = (wcsstr(exeName, L"windhawk.exe") != NULL);
+
+
+    if (!isExplorer && !isWindhawk) {
+        return TRUE;
     }
 
-    HANDLE hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (!hEvent) return FALSE;
-    
-    g_threadRunning = true;
-    g_renderThreadHandle = CreateThread(NULL, 0, OverlayThreadProc, hEvent, 0, NULL);
-    if (!g_renderThreadHandle) {
+    if (isExplorer) {
+        HMODULE twinui = LoadLibraryW(L"twinui.pcshell.dll");
+        if (twinui) {
+            // twinui.pcshell.dll
+            WindhawkUtils::SYMBOL_HOOK hooks[] = {
+                { {LR"(public: virtual long __cdecl XamlAltTabViewHost::ViewLoaded(void))"}, &XamlAltTabViewHost_ViewLoaded_Original, XamlAltTabViewHost_ViewLoaded_Hook, false },
+                { {LR"(private: void __cdecl XamlAltTabViewHost::DisplayAltTab(void))"}, &XamlAltTabViewHost_DisplayAltTab_Original, XamlAltTabViewHost_DisplayAltTab_Hook, false },
+                { {LR"(public: virtual long __cdecl CAltTabViewHost::Show(struct IImmersiveMonitor *,enum ALT_TAB_VIEW_FLAGS,struct IApplicationView *))"}, &CAltTabViewHost_Show_Original, CAltTabViewHost_Show_Hook, false }
+            };
+            if (!WindhawkUtils::HookSymbols(twinui, hooks, ARRAYSIZE(hooks))) {
+                Wh_Log(L"Dynamic Alt-Tab: Failed to hook twinui.pcshell.dll symbols. Falling back to keyboard hook trigger.");
+            }
+        } else {
+            Wh_Log(L"Dynamic Alt-Tab: twinui.pcshell.dll not found on this build. Falling back to keyboard hook trigger.");
+        }
+        
+        if (!WindhawkUtils::SetFunctionHook((void*)ShowWindow, (void*)ShowWindow_Hook, (void**)&ShowWindow_Original)) {
+            Wh_Log(L"Dynamic Alt-Tab: Failed to hook ShowWindow. Mod may not function correctly.");
+            return FALSE;
+        }
+
+        HANDLE hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (!hEvent) return FALSE;
+        
+        g_threadRunning = true;
+        g_renderThreadHandle = CreateThread(NULL, 0, OverlayThreadProc, hEvent, 0, NULL);
+        if (!g_renderThreadHandle) {
+            CloseHandle(hEvent);
+            return FALSE;
+        }
+        
+        WaitForSingleObject(hEvent, 3000);
         CloseHandle(hEvent);
-        return FALSE;
     }
-    
-    WaitForSingleObject(hEvent, 3000);
-    CloseHandle(hEvent);
-    
+
+
+    // The keys are piped instantly to the Explorer overlay via PostMessage.
     HANDLE hHookEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     g_hookThreadHandle = CreateThread(NULL, 0, HookThreadProc, hHookEvent, 0, &g_hookThreadId);
     if (g_hookThreadHandle) {
