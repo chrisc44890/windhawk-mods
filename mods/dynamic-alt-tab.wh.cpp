@@ -6,6 +6,7 @@
 // @author        TheatriChris
 // @github        https://github.com/chrisc44890
 // @include       explorer.exe
+// @include       windhawk.exe
 // @compilerOptions -ld2d1 -ldwmapi -lole32 -lgdi32 -ldwrite
 // ==/WindhawkMod==
 
@@ -26,6 +27,10 @@ mod works without them.
 Only one running `explorer.exe` process (the one hosting the taskbar/shell)
 owns the overlay and keyboard hook; any secondary Explorer window processes
 stay inert to avoid duplicate overlays.
+
+There is a known issue with elevated processes when a user is logged off, the system is shut down, or explorer.exe restarts for any reason.
+The default alt-tab interface will appear on first press of alt-tab. This can be fixed by disabling and enabling the mod again.
+A fix is being looked into for the next version.
 
 ### Features
 * **Hardware Accelerated:** Built with Direct2D 1.1 for buttery smooth 60FPS rendering.
