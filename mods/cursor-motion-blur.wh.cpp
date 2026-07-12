@@ -2,7 +2,7 @@
 // @id              cursor-motion-blur
 // @name            Cursor Motion Blur
 // @description     Adds high-speed cartoon motion blur to your mouse pointer.
-// @version         2.0
+// @version         2.1
 // @author          TheatriChris
 // @github          https://github.com/chrisc44890
 // @license         MIT
@@ -44,6 +44,13 @@ Replaces your standard Windows cursor with a smooth, tapered motion blur trail w
 - tail_length: 10
   $name: Tail Length
   $description: How many frames the blur trails behind you.
+- outer_color: "#000000"
+  $name: Outer Color
+  $description: Outline color in #RRGGBBAA format.
+
+- inner_color: "#FFFFFF"
+  $name: Inner Color
+  $description: Core color in #RRGGBBAA format.
 */
 // ==/WindhawkModSettings==
 
@@ -79,6 +86,54 @@ int g_tailOffsetX = 6;
 int g_tailOffsetY = 10;
 int g_tailLength = 10;
 
+float g_outerR = 0.0f;
+float g_outerG = 0.0f;
+float g_outerB = 0.0f;
+float g_outerA = 0.86f;
+
+float g_innerR = 1.0f;
+float g_innerG = 1.0f;
+float g_innerB = 1.0f;
+float g_innerA = 0.86f;
+
+bool ParseColor(const std::wstring& hex,
+                   float& r,
+                   float& g,
+                   float& b,
+                   float& a)
+{
+    if (hex.empty() || hex[0] != L'#')
+        return false;
+
+    unsigned int ri, gi, bi, ai = 255;
+
+    if (hex.length() == 7)
+    {
+        // #RRGGBB
+        if (swscanf_s(hex.c_str(), L"#%02x%02x%02x",
+                      &ri, &gi, &bi) != 3)
+            return false;
+    }
+    else if (hex.length() == 9)
+    {
+        // #RRGGBBAA
+        if (swscanf_s(hex.c_str(), L"#%02x%02x%02x%02x",
+                      &ri, &gi, &bi, &ai) != 4)
+            return false;
+    }
+    else
+    {
+        return false;
+    }
+
+    r = ri / 255.0f;
+    g = gi / 255.0f;
+    b = bi / 255.0f;
+    a = ai / 255.0f;
+
+    return true;
+}
+
 void LoadSettings() {
     g_triggerVelocity = (float)Wh_GetIntSetting(L"trigger_velocity");
     g_stopVelocity = (float)Wh_GetIntSetting(L"stop_velocity");
@@ -89,6 +144,36 @@ void LoadSettings() {
     if (g_triggerVelocity <= 0.0f) g_triggerVelocity = 25.0f;
     if (g_stopVelocity <= 0.0f) g_stopVelocity = 10.0f;
     if (g_tailLength < 2) g_tailLength = 10; 
+    std::wstring outer = Wh_GetStringSetting(L"outer_color");
+
+    if (!ParseColor(
+    outer,
+    g_outerR,
+    g_outerG,
+    g_outerB,
+    g_outerA))
+    {
+        g_outerR = 0.0f;
+        g_outerG = 0.0f;
+        g_outerB = 0.0f;
+        g_outerA = 0.86f;
+    }
+
+    std::wstring inner =
+        Wh_GetStringSetting(L"inner_color");
+
+    if (!ParseColor(
+    inner,
+    g_innerR,
+    g_innerG,
+    g_innerB,
+    g_innerA))
+    {
+        g_innerR = 1.0f;
+        g_innerG = 1.0f;
+        g_innerB = 1.0f;
+        g_innerA = 0.86f;
+    }
 }
 
 bool IsGameRunning() {
@@ -253,8 +338,8 @@ VOID CALLBACK SmearTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTim
 
             if (g_pDCRenderTarget) {
                 // Solid colors for the perfectly rounded head caps and the entire body
-                g_pDCRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.86f), &g_pCapBlackBrush);
-                g_pDCRenderTarget->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.86f), &g_pCapWhiteBrush);
+                g_pDCRenderTarget->CreateSolidColorBrush(D2D1::ColorF(g_outerR, g_outerG, g_outerB, g_outerA), &g_pCapBlackBrush);
+                g_pDCRenderTarget->CreateSolidColorBrush(D2D1::ColorF(g_innerR, g_innerG, g_innerB, g_innerA)                  , &g_pCapWhiteBrush);
             }
         }
 
@@ -477,6 +562,26 @@ void WhTool_ModUninit() {
 
 void WhTool_ModSettingsChanged() {
     LoadSettings();
+
+    if (g_pCapBlackBrush) {
+        g_pCapBlackBrush->Release();
+        g_pCapBlackBrush = nullptr;
+    }
+
+    if (g_pCapWhiteBrush) {
+        g_pCapWhiteBrush->Release();
+        g_pCapWhiteBrush = nullptr;
+    }
+
+    if (g_pDCRenderTarget) {
+        g_pDCRenderTarget->CreateSolidColorBrush(
+            D2D1::ColorF(g_outerR, g_outerG, g_outerB, g_outerA),
+            &g_pCapBlackBrush);
+
+        g_pDCRenderTarget->CreateSolidColorBrush(
+            D2D1::ColorF(g_innerR, g_innerG, g_innerB, g_innerA),
+            &g_pCapWhiteBrush);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
