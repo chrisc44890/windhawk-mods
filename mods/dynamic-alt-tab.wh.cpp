@@ -5,7 +5,7 @@
 // @version       1.0
 // @author        TheatriChris
 // @github        https://github.com/chrisc44890
-// @include       *
+// @include       explorer.exe
 // @compilerOptions -ld2d1 -ldwmapi -lole32 -lgdi32 -lshell32 -ldwrite -lversion -luuid
 // ==/WindhawkMod==
 
