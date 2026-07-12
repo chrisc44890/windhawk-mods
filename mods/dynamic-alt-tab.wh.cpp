@@ -2,11 +2,11 @@
 // @id            dynamic-alt-tab
 // @name          Dynamic Alt-Tab
 // @description   Replaces the native Windows Alt-Tab with a fluid, hardware-accelerated live glass carousel and custom themes.
-// @version       1.0
+// @version       1.3
 // @author        TheatriChris
 // @github        https://github.com/chrisc44890
 // @include       explorer.exe
-// @compilerOptions -ld2d1 -ldwmapi -lole32 -lgdi32 -lshell32 -ldwrite -lversion -luuid
+// @compilerOptions -ld2d1 -ldwmapi -lole32 -lgdi32 -ldwrite
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -14,13 +14,18 @@
 # Dynamic Alt-Tab
 Replaces the native Windows Alt-Tab screen with a fluid, hardware-accelerated live glass carousel and custom themes.
 
-**Note:** This mod prefers to trigger off internal Windows 11 shell APIs
-(`twinui.pcshell.dll`), which is the most reliable method and is immune to
-focus-related quirks with elevated windows. On Windows builds where those
-internal symbols aren't available, the mod automatically falls back to a
-low-level keyboard hook instead; in that fallback mode, the carousel may
-occasionally fail to appear while an elevated (Run as Administrator) window
-is focused, due to Windows' UIPI input isolation between integrity levels.
+**Note:** This mod triggers off the low-level keyboard hook, since Explorer
+runs at Medium Integrity and cannot see input while an elevated
+(Run as Administrator) window has focus - Windows' UIPI input isolation
+blocks it. If the carousel doesn't appear while an elevated window is
+focused, this is that limitation, not a bug. Internal Windows shell symbols
+(`twinui.pcshell.dll`) are used opportunistically as a secondary trigger and
+to suppress the native Alt-Tab UI, but availability varies by build and the
+mod works without them.
+
+Only one running `explorer.exe` process (the one hosting the taskbar/shell)
+owns the overlay and keyboard hook; any secondary Explorer window processes
+stay inert to avoid duplicate overlays.
 
 ### Features
 * **Hardware Accelerated:** Built with Direct2D 1.1 for buttery smooth 60FPS rendering.
@@ -63,6 +68,7 @@ is focused, due to Windows' UIPI input isolation between integrity levels.
 #include <string>
 #include <atomic>
 #include <algorithm>
+#include <shellapi.h>
 #include <windhawk_utils.h>
 
 #define WM_ALTTAB_TRIGGER (WM_APP + 101)
@@ -86,7 +92,10 @@ struct CompositionAttributeData {
 
 typedef BOOL(WINAPI* SetWindowCompositionAttribute_t)(HWND, CompositionAttributeData*);
 
-HWND g_overlayHwnd = NULL;
+// g_overlayHwnd is read from the hook thread and from whichever thread
+// Explorer calls its own alt-tab entry points on, and written once by the
+// render thread - atomic for a well-defined cross-thread read.
+std::atomic<HWND> g_overlayHwnd(NULL);
 HANDLE g_renderThreadHandle = NULL;
 std::atomic<bool> g_threadRunning(false);
 
@@ -96,7 +105,6 @@ HHOOK g_keyboardHook = NULL;
 
 ID2D1Factory1* g_pD2DFactory = nullptr;
 ID2D1DCRenderTarget* g_pDCRenderTarget = nullptr;
-ID2D1DeviceContext* g_pDeviceContext = nullptr; 
 
 IDWriteFactory* g_pDWriteFactory = nullptr;
 IDWriteTextFormat* g_pTextFormat = nullptr;
@@ -130,6 +138,13 @@ std::atomic<bool> g_wantsToOpen(false);
 std::atomic<bool> g_cancelAltTab(false);
 std::atomic<int> g_tabSteps(0);
 std::atomic<DWORD> g_threadIdForAltTabShowWindow(0);
+
+// High-resolution timer / 8ms render timer are only active while the
+// carousel is open or animating closed - see StartAltTab / RenderTimerProc.
+HMODULE g_hWinmm = NULL;
+timeBeginPeriod_t g_pTimeBeginPeriod = nullptr;
+timeEndPeriod_t g_pTimeEndPeriod = nullptr;
+bool g_fastTimerActive = false;
 
 float g_leftPoolX1 = 0.0f;
 float g_leftPoolX2 = 0.0f;
@@ -181,6 +196,39 @@ void LoadSettings() {
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
+}
+
+// Only one running explorer.exe process should own the overlay and keyboard
+// hook. Windows can run multiple explorer.exe processes at once (e.g. with
+// "Launch folder windows in a separate process" enabled, or transient
+// per-window processes); we identify the actual shell process - the one
+// hosting the taskbar/desktop - instantly via PID or command line args.
+bool IsMainShellProcess() {
+    HWND shellWnd = GetShellWindow();
+    if (shellWnd) {
+        DWORD shellPid = 0;
+        GetWindowThreadProcessId(shellWnd, &shellPid);
+        return shellPid == GetCurrentProcessId();
+    }
+
+    // If the shell window isn't created yet (e.g. during a fresh boot or explorer restart),
+    // we check the command line. The main desktop shell does NOT use the /factory flag.
+    // Folder windows running in separate processes do.
+    int argc;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        for (int i = 1; i < argc; i++) {
+            std::wstring arg = argv[i];
+            std::transform(arg.begin(), arg.end(), arg.begin(), ::towlower);
+            if (arg.find(L"/factory") != std::wstring::npos) {
+                LocalFree(argv);
+                return false;
+            }
+        }
+        LocalFree(argv);
+    }
+    
+    return true;
 }
 
 std::wstring GetWindowTextSafe(HWND hwnd) {
@@ -262,19 +310,39 @@ D2D1_COLOR_F GetM3Color(int index, float alpha) {
 }
 
 void ForceForegroundOverlay() {
+    HWND overlay = g_overlayHwnd.load();
     HWND curFg = GetForegroundWindow();
     DWORD fgThread = curFg ? GetWindowThreadProcessId(curFg, NULL) : 0;
     DWORD myThread = GetCurrentThreadId();
 
     if (fgThread != 0 && fgThread != myThread) {
         AttachThreadInput(fgThread, myThread, TRUE);
-        SetForegroundWindow(g_overlayHwnd);
-        SetFocus(g_overlayHwnd);
+        SetForegroundWindow(overlay);
+        SetFocus(overlay);
         AttachThreadInput(fgThread, myThread, FALSE);
     } else {
-        SetForegroundWindow(g_overlayHwnd);
-        SetFocus(g_overlayHwnd);
+        SetForegroundWindow(overlay);
+        SetFocus(overlay);
     }
+}
+
+VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime);
+
+// Starts (or resumes) the fast 8ms render timer and bumps the system timer
+// resolution to 1ms - only while the carousel is actually visible/animating,
+// not for the mod's whole lifetime.
+void EnsureFastTimerRunning() {
+    if (g_fastTimerActive) return;
+    g_fastTimerActive = true;
+    if (g_pTimeBeginPeriod) g_pTimeBeginPeriod(1);
+    SetTimer(g_overlayHwnd.load(), 1, 8, RenderTimerProc);
+}
+
+void StopFastTimer(HWND hwnd) {
+    if (!g_fastTimerActive) return;
+    g_fastTimerActive = false;
+    KillTimer(hwnd, 1);
+    if (g_pTimeEndPeriod) g_pTimeEndPeriod(1);
 }
 
 void StartAltTab() {
@@ -302,7 +370,7 @@ void StartAltTab() {
     g_selectedIndex = 0; 
     
     for (auto& card : g_cards) {
-        DwmRegisterThumbnail(g_overlayHwnd, card.hwnd, &card.thumbnail);
+        DwmRegisterThumbnail(g_overlayHwnd.load(), card.hwnd, &card.thumbnail);
         card.currentX = 0.0f;
         card.currentY = 0.0f;
         card.currentScale = 0.1f;
@@ -323,8 +391,10 @@ void StartAltTab() {
     g_rightPoolScale = 0.0f;
     g_rightPoolVx1 = 0.0f; g_rightPoolVx2 = 0.0f; g_rightPoolVy = 0.0f; g_rightPoolVScale = 0.0f;
     
-    ShowWindow(g_overlayHwnd, SW_SHOWNA);
+    ShowWindow(g_overlayHwnd.load(), SW_SHOWNA);
     ForceForegroundOverlay();
+
+    EnsureFastTimerRunning();
 }
 
 void StopAltTab() {
@@ -343,39 +413,34 @@ void StopAltTab() {
     g_targetHwnd = g_cards[g_selectedIndex].hwnd;
 }
 
-// Global debounced trigger to handle both native hooks and fallback hooks gracefully
-void TriggerOpenIfOutermost(bool shiftDown) {
-    static DWORD lastTriggerTime = 0;
-    DWORD now = GetTickCount();
-    if (now - lastTriggerTime < 50) return; // 50ms debounce
-    lastTriggerTime = now;
-
-    if (!g_wantsToOpen.load()) {
-        g_wantsToOpen = true;
-        g_tabSteps = shiftDown ? -1 : 1;
-    } else {
-        g_tabSteps.fetch_add(shiftDown ? -1 : 1);
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Fallback trigger path: low-level keyboard hook.
-// IPC via PostMessage lets high-integrity processes (Windhawk) alert
-// the medium-integrity process (Explorer) without spanning multiple overlays.
+// Low-level keyboard hook: the mod's primary trigger, since it works
+// regardless of whether the twinui.pcshell.dll symbols resolve on this
+// Windows build. Only swallows Alt+Tab when it can actually hand off to the
+// overlay - if the overlay doesn't exist (init failed, still starting up,
+// or mid-teardown), the real Windows Alt+Tab is left to run normally so the
+// user is never left without ANY way to switch windows.
 // ---------------------------------------------------------------------------
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     static bool s_tabDown = false;
     if (nCode == HC_ACTION) {
         KBDLLHOOKSTRUCT* p = (KBDLLHOOKSTRUCT*)lParam;
         bool altDown = ((p->flags & LLKHF_ALTDOWN) != 0) || (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-        
+
         if (p->vkCode == VK_TAB && altDown) {
+            HWND overlay = g_overlayHwnd.load();
+            if (!overlay) {
+                // No overlay to hand off to - let the native Alt+Tab through
+                // rather than eating the keystroke with nothing to show.
+                return CallNextHookEx(NULL, nCode, wParam, lParam);
+            }
+
             if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
                 if (!s_tabDown) {
                     s_tabDown = true;
+                    g_wantsToOpen = true; // Block native window instantly
                     bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-                    HWND overlay = FindWindowW(L"GlassAltTabOverlayClass", L"GlassAltTabOverlay");
-                    if (overlay) PostMessageW(overlay, WM_ALTTAB_TRIGGER, shiftDown ? 1 : 0, 0);
+                    PostMessageW(overlay, WM_ALTTAB_TRIGGER, shiftDown ? 1 : 0, 0);
                 }
             } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
                 s_tabDown = false;
@@ -384,8 +449,11 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         }
         
         if ((p->vkCode == VK_LMENU || p->vkCode == VK_RMENU || p->vkCode == VK_MENU) && (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)) {
-            HWND overlay = FindWindowW(L"GlassAltTabOverlayClass", L"GlassAltTabOverlay");
-            if (overlay) PostMessageW(overlay, WM_ALTTAB_CANCEL, 0, 0);
+            HWND overlay = g_overlayHwnd.load();
+            if (overlay) {
+                g_wantsToOpen = false;
+                PostMessageW(overlay, WM_ALTTAB_CANCEL, 0, 0);
+            }
             s_tabDown = false;
         }
     }
@@ -406,8 +474,27 @@ DWORD WINAPI HookThreadProc(LPVOID lpParam) {
     return 0;
 }
 
+// Single entry point for opening/cycling the carousel. Only ever called from
+// the render thread (via WM_ALTTAB_TRIGGER in OverlayWndProc) since it may
+// call StartAltTab(), which touches the overlay window, D2D resources, and
+// DWM thumbnails - all of which should stay on the thread that created them.
+void TriggerOpenIfOutermost(bool shiftDown) {
+    static DWORD lastTriggerTime = 0;
+    DWORD now = GetTickCount();
+    if (now - lastTriggerTime < 50) return; // 50ms debounce
+    lastTriggerTime = now;
+
+    g_wantsToOpen = true;
+
+    if (!g_isAltTabbing) {
+        g_tabSteps.store(shiftDown ? -1 : 1);
+        StartAltTab();
+    } else {
+        g_tabSteps.fetch_add(shiftDown ? -1 : 1);
+    }
+}
+
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    // Inter-Process Communication handler
     if (uMsg == WM_ALTTAB_TRIGGER) {
         TriggerOpenIfOutermost(wParam == 1);
         return 0;
@@ -513,6 +600,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
     bool wantsToOpen = g_wantsToOpen.load();
     if (wantsToOpen && !g_isAltTabbing) {
+        // Defensive fallback only; the normal path calls StartAltTab()
+        // directly from WM_ALTTAB_TRIGGER the moment a press comes in.
         StartAltTab();
     } else if (!wantsToOpen && g_isAltTabbing && !g_isClosing) {
         StopAltTab();
@@ -543,6 +632,10 @@ VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTi
         g_cards.clear();
         ShowWindow(hwnd, SW_HIDE);
         ReleaseDC(NULL, hdcScreen);
+
+        // Carousel is fully closed - stop the fast timer and drop the
+        // system timer resolution back down until the next Alt+Tab press.
+        StopFastTimer(hwnd);
 
         // NOW we actually switch the window, after the GPU is done with our animation
         if (g_targetHwnd) {
@@ -580,7 +673,6 @@ VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTi
         if (g_pDCRenderTarget) {
             g_pDCRenderTarget->Release();
             g_pDCRenderTarget = nullptr;
-            if (g_pDeviceContext) { g_pDeviceContext->Release(); g_pDeviceContext = nullptr; }
         }
     }
     
@@ -591,10 +683,6 @@ VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTi
             0, 0, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT
         );
         g_pD2DFactory->CreateDCRenderTarget(&props, &g_pDCRenderTarget);
-
-        if (g_pDCRenderTarget) {
-            g_pDCRenderTarget->QueryInterface(__uuidof(ID2D1DeviceContext), (void**)&g_pDeviceContext);
-        }
         
         g_pDCRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &g_pGlassBrush);
         g_pDCRenderTarget->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), &g_pBorderBrush);
@@ -641,8 +729,6 @@ VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTi
         for (int i = 0; i < (int)g_cards.size(); ++i) {
             AppCard& card = g_cards[i];
             float offset = (float)i - (float)g_selectedIndex;
-            float distance = fabsf(offset);
-            (void)distance;
 
             if (g_theme == 1) { 
                 // macOS Flat Grid Style
@@ -906,7 +992,6 @@ VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTi
             AppCard& card = g_cards[i];
             float offset = (float)i - (float)g_selectedIndex;
             float distance = fabsf(offset);
-            (void)distance; 
             
             float cardOpacity = g_introOutroProgress;
             if (g_theme != 1 && g_theme != 3 && g_theme != 0) {
@@ -1096,7 +1181,6 @@ VOID CALLBACK RenderTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTi
         if (hr == D2DERR_RECREATE_TARGET) {
             g_pDCRenderTarget->Release();
             g_pDCRenderTarget = nullptr;
-            if (g_pDeviceContext) { g_pDeviceContext->Release(); g_pDeviceContext = nullptr; }
         }
     }
     
@@ -1150,20 +1234,21 @@ DWORD WINAPI OverlayThreadProc(LPVOID lpParam) {
     int screenW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     int screenH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-    g_overlayHwnd = CreateWindowEx(
+    HWND overlayHwnd = CreateWindowEx(
         WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         CLASS_NAME, L"GlassAltTabOverlay", WS_POPUP,
         screenX, screenY, screenW, screenH,
         NULL, NULL, hInstance, NULL
     );
+    g_overlayHwnd = overlayHwnd;
 
-    if (!g_overlayHwnd) {
+    if (!overlayHwnd) {
         if (hEvent) SetEvent(hEvent);
         return 0;
     }
 
     int backdrop = 3; 
-    DwmSetWindowAttribute(g_overlayHwnd, 38, &backdrop, sizeof(backdrop));
+    DwmSetWindowAttribute(overlayHwnd, 38, &backdrop, sizeof(backdrop));
 
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
     if (user32) {
@@ -1171,31 +1256,29 @@ DWORD WINAPI OverlayThreadProc(LPVOID lpParam) {
         if (setWindowCompositionAttribute) {
             AccentPolicy policy = { 4, 1, 0x90000000, 0 }; 
             CompositionAttributeData data = { 19, &policy, sizeof(policy) }; 
-            setWindowCompositionAttribute(g_overlayHwnd, &data);
+            setWindowCompositionAttribute(overlayHwnd, &data);
         }
     }
 
     if (hEvent) SetEvent(hEvent);
 
-    timeBeginPeriod_t pTimeBeginPeriod = nullptr;
-    timeEndPeriod_t pTimeEndPeriod = nullptr;
-    HMODULE hWinmm = LoadLibraryW(L"winmm.dll");
-    if (hWinmm) {
-        pTimeBeginPeriod = (timeBeginPeriod_t)GetProcAddress(hWinmm, "timeBeginPeriod");
-        pTimeEndPeriod = (timeEndPeriod_t)GetProcAddress(hWinmm, "timeEndPeriod");
+    // Loaded once up front so timeBeginPeriod/timeEndPeriod are available
+    // whenever the carousel opens/closes, but the resolution bump itself is
+    // only applied for the duration of an open carousel (see
+    // EnsureFastTimerRunning / StopFastTimer).
+    g_hWinmm = LoadLibraryExW(L"winmm.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (g_hWinmm) {
+        g_pTimeBeginPeriod = (timeBeginPeriod_t)GetProcAddress(g_hWinmm, "timeBeginPeriod");
+        g_pTimeEndPeriod = (timeEndPeriod_t)GetProcAddress(g_hWinmm, "timeEndPeriod");
     }
-
-    if (pTimeBeginPeriod) pTimeBeginPeriod(1);
-    SetTimer(g_overlayHwnd, 1, 8, RenderTimerProc);
 
     MSG msg;
     while (g_threadRunning && GetMessage(&msg, NULL, 0, 0)) {
         DispatchMessage(&msg);
     }
 
-    KillTimer(g_overlayHwnd, 1);
-    if (pTimeEndPeriod) pTimeEndPeriod(1);
-    if (hWinmm) FreeLibrary(hWinmm);
+    StopFastTimer(overlayHwnd);
+    if (g_hWinmm) FreeLibrary(g_hWinmm);
     
     for (auto& card : g_cards) {
         if (card.thumbnail) DwmUnregisterThumbnail(card.thumbnail);
@@ -1210,8 +1293,6 @@ DWORD WINAPI OverlayThreadProc(LPVOID lpParam) {
     if (g_pDimBrush) { g_pDimBrush->Release(); g_pDimBrush = nullptr; }
     if (g_pWhiteBrush) { g_pWhiteBrush->Release(); g_pWhiteBrush = nullptr; }
     
-    if (g_pDeviceContext) { g_pDeviceContext->Release(); g_pDeviceContext = nullptr; }
-    
     if (g_pTextFormat) { g_pTextFormat->Release(); g_pTextFormat = nullptr; }
     if (g_pDWriteFactory) { g_pDWriteFactory->Release(); g_pDWriteFactory = nullptr; }
     if (g_pDCRenderTarget) { g_pDCRenderTarget->Release(); g_pDCRenderTarget = nullptr; }
@@ -1219,7 +1300,8 @@ DWORD WINAPI OverlayThreadProc(LPVOID lpParam) {
     if (g_hBitmap) { DeleteObject(g_hBitmap); g_hBitmap = NULL; }
     if (g_hdcMem) { DeleteDC(g_hdcMem); g_hdcMem = NULL; }
 
-    DestroyWindow(g_overlayHwnd);
+    DestroyWindow(overlayHwnd);
+    g_overlayHwnd = NULL;
     UnregisterClass(CLASS_NAME, hInstance);
     CoUninitialize();
     return 0;
@@ -1230,6 +1312,11 @@ struct AutoThreadId {
     ~AutoThreadId() { g_threadIdForAltTabShowWindow = 0; }
 };
 
+// Secondary trigger path via Explorer's own internal shell APIs, used
+// opportunistically when twinui.pcshell.dll's symbols resolve (see
+// Wh_ModInit). These run on whatever thread Explorer calls them on, so - like
+// the keyboard hook - they only ever post a message to the overlay rather
+// than touching the overlay/D2D state directly.
 using XamlAltTabViewHost_ViewLoaded_t = void(WINAPI*)(void*);
 XamlAltTabViewHost_ViewLoaded_t XamlAltTabViewHost_ViewLoaded_Original;
 void WINAPI XamlAltTabViewHost_ViewLoaded_Hook(void* pThis) {
@@ -1240,7 +1327,13 @@ void WINAPI XamlAltTabViewHost_ViewLoaded_Hook(void* pThis) {
 using XamlAltTabViewHost_DisplayAltTab_t = void(WINAPI*)(void*);
 XamlAltTabViewHost_DisplayAltTab_t XamlAltTabViewHost_DisplayAltTab_Original;
 void WINAPI XamlAltTabViewHost_DisplayAltTab_Hook(void* pThis) {
-    TriggerOpenIfOutermost(false);
+    HWND overlay = g_overlayHwnd.load();
+    if (overlay) {
+        g_wantsToOpen = true; // Synchronously block native window
+        bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        PostMessageW(overlay, WM_ALTTAB_TRIGGER, shiftDown ? 1 : 0, 0);
+    }
+
     if (g_threadIdForAltTabShowWindow != 0) return XamlAltTabViewHost_DisplayAltTab_Original(pThis);
     AutoThreadId lock;
     XamlAltTabViewHost_DisplayAltTab_Original(pThis);
@@ -1249,7 +1342,13 @@ void WINAPI XamlAltTabViewHost_DisplayAltTab_Hook(void* pThis) {
 using CAltTabViewHost_Show_t = HRESULT(WINAPI*)(void*, void*, void*, void*);
 CAltTabViewHost_Show_t CAltTabViewHost_Show_Original;
 HRESULT WINAPI CAltTabViewHost_Show_Hook(void* pThis, void* p1, void* p2, void* p3) {
-    TriggerOpenIfOutermost(false);
+    HWND overlay = g_overlayHwnd.load();
+    if (overlay) {
+        g_wantsToOpen = true; // Synchronously block native window
+        bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        PostMessageW(overlay, WM_ALTTAB_TRIGGER, shiftDown ? 1 : 0, 0);
+    }
+
     AutoThreadId lock;
     return CAltTabViewHost_Show_Original(pThis, p1, p2, p3);
 }
@@ -1276,63 +1375,66 @@ BOOL WINAPI ShowWindow_Hook(HWND hWnd, int nCmdShow) {
 BOOL Wh_ModInit() {
     LoadSettings();
 
-    WCHAR exeName[MAX_PATH];
-    GetModuleFileNameW(NULL, exeName, MAX_PATH);
-    _wcslwr_s(exeName);
-
-    bool isExplorer = (wcsstr(exeName, L"explorer.exe") != NULL);
-    bool isWindhawk = (wcsstr(exeName, L"windhawk.exe") != NULL);
-
-    // If we're inside a random game/browser, bail out instantly to save resources.
-    // The explorer and windhawk hooks are enough to catch elevated and non-elevated keys.
-    if (!isExplorer && !isWindhawk) {
+    if (!IsMainShellProcess()) {
+        // Not the primary shell explorer.exe (e.g. a secondary File Explorer
+        // window process spawned when "Launch folder windows in a separate
+        // process" is enabled, or any other transient explorer.exe). Only
+        // one process should own the overlay and global keyboard hook, so
+        // every other instance stays fully inert.
         return TRUE;
     }
 
-    if (isExplorer) {
-        // EXPLORER ONLY: We only want ONE overlay window rendering at a time!
-        HMODULE twinui = LoadLibraryW(L"twinui.pcshell.dll");
-        if (twinui) {
-            // twinui.pcshell.dll
-            WindhawkUtils::SYMBOL_HOOK hooks[] = {
-                { {LR"(public: virtual long __cdecl XamlAltTabViewHost::ViewLoaded(void))"}, &XamlAltTabViewHost_ViewLoaded_Original, XamlAltTabViewHost_ViewLoaded_Hook, false },
-                { {LR"(private: void __cdecl XamlAltTabViewHost::DisplayAltTab(void))"}, &XamlAltTabViewHost_DisplayAltTab_Original, XamlAltTabViewHost_DisplayAltTab_Hook, false },
-                { {LR"(public: virtual long __cdecl CAltTabViewHost::Show(struct IImmersiveMonitor *,enum ALT_TAB_VIEW_FLAGS,struct IApplicationView *))"}, &CAltTabViewHost_Show_Original, CAltTabViewHost_Show_Hook, false }
-            };
-            if (!WindhawkUtils::HookSymbols(twinui, hooks, ARRAYSIZE(hooks))) {
-                Wh_Log(L"Dynamic Alt-Tab: Failed to hook twinui.pcshell.dll symbols. Falling back to keyboard hook trigger.");
-            }
-        } else {
-            Wh_Log(L"Dynamic Alt-Tab: twinui.pcshell.dll not found on this build. Falling back to keyboard hook trigger.");
+    // twinui.pcshell.dll is already loaded inside the real shell process by
+    // the time this runs, so GetModuleHandle is enough - no LoadLibrary/
+    // FreeLibrary bookkeeping needed, and it sidesteps any DLL search-order
+    // surface entirely.
+    HMODULE twinui = GetModuleHandleW(L"twinui.pcshell.dll");
+    if (twinui) {
+        // twinui.pcshell.dll
+        WindhawkUtils::SYMBOL_HOOK hooks[] = {
+            { {LR"(public: virtual long __cdecl XamlAltTabViewHost::ViewLoaded(void))"}, &XamlAltTabViewHost_ViewLoaded_Original, XamlAltTabViewHost_ViewLoaded_Hook, false },
+            { {LR"(private: void __cdecl XamlAltTabViewHost::DisplayAltTab(void))"}, &XamlAltTabViewHost_DisplayAltTab_Original, XamlAltTabViewHost_DisplayAltTab_Hook, false },
+            { {LR"(public: virtual long __cdecl CAltTabViewHost::Show(struct IImmersiveMonitor *,enum ALT_TAB_VIEW_FLAGS,struct IApplicationView *))"}, &CAltTabViewHost_Show_Original, CAltTabViewHost_Show_Hook, false }
+        };
+        if (!WindhawkUtils::HookSymbols(twinui, hooks, ARRAYSIZE(hooks))) {
+            Wh_Log(L"Failed to hook twinui.pcshell.dll symbols; relying on the keyboard hook as the sole trigger.");
         }
-        
-        if (!WindhawkUtils::SetFunctionHook((void*)ShowWindow, (void*)ShowWindow_Hook, (void**)&ShowWindow_Original)) {
-            Wh_Log(L"Dynamic Alt-Tab: Failed to hook ShowWindow. Mod may not function correctly.");
-            return FALSE;
-        }
-
-        HANDLE hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-        if (!hEvent) return FALSE;
-        
-        g_threadRunning = true;
-        g_renderThreadHandle = CreateThread(NULL, 0, OverlayThreadProc, hEvent, 0, NULL);
-        if (!g_renderThreadHandle) {
-            CloseHandle(hEvent);
-            return FALSE;
-        }
-        
-        WaitForSingleObject(hEvent, 3000);
-        CloseHandle(hEvent);
+    } else {
+        Wh_Log(L"twinui.pcshell.dll not loaded in this process; relying on the keyboard hook as the sole trigger.");
+    }
+    
+    if (!WindhawkUtils::SetFunctionHook((void*)ShowWindow, (void*)ShowWindow_Hook, (void**)&ShowWindow_Original)) {
+        Wh_Log(L"Failed to hook ShowWindow. Mod cannot function.");
+        return FALSE;
     }
 
-    // EXPLORER & WINDHAWK: We install the keyboard hook so we can catch keys in 
-    // Medium Integrity (Explorer) AND High Integrity (Windhawk).
-    // The keys are piped instantly to the Explorer overlay via PostMessage!
+    HANDLE hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!hEvent) return FALSE;
+    
+    g_threadRunning = true;
+    g_renderThreadHandle = CreateThread(NULL, 0, OverlayThreadProc, hEvent, 0, NULL);
+    if (!g_renderThreadHandle) {
+        CloseHandle(hEvent);
+        return FALSE;
+    }
+    
+    WaitForSingleObject(hEvent, 3000);
+    CloseHandle(hEvent);
+
+    // The keyboard hook is the mod's primary/only reliable trigger on builds
+    // where twinui.pcshell.dll's symbols don't resolve, and remains active
+    // as a redundant trigger even when they do (see TriggerOpenIfOutermost's
+    // debounce, which collapses duplicate fires from both paths). Note this
+    // only ever runs at Explorer's Medium Integrity level - see README for
+    // the elevated-window limitation that follows from that.
     HANDLE hHookEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     g_hookThreadHandle = CreateThread(NULL, 0, HookThreadProc, hHookEvent, 0, &g_hookThreadId);
     if (g_hookThreadHandle) {
         WaitForSingleObject(hHookEvent, 3000);
         CloseHandle(hHookEvent);
+    } else {
+        Wh_Log(L"Failed to start keyboard hook thread. Mod cannot function.");
+        return FALSE;
     }
     
     return TRUE;
@@ -1346,8 +1448,8 @@ void Wh_ModUninit() {
         g_hookThreadHandle = NULL;
     }
     g_threadRunning = false;
-    if (g_overlayHwnd) {
-        PostMessage(g_overlayHwnd, WM_QUIT, 0, 0);
+    if (g_overlayHwnd.load()) {
+        PostMessage(g_overlayHwnd.load(), WM_QUIT, 0, 0);
     }
     if (g_renderThreadHandle) {
         WaitForSingleObject(g_renderThreadHandle, INFINITE);
